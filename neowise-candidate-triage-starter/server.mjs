@@ -5,8 +5,12 @@ import { classify } from "./mock-ai.mjs";
 const html = await readFile(new URL("./index.html", import.meta.url));
 
 const MAX_BODY_BYTES = 64 * 1024;
+const MODEL_TIMEOUT_MS = 300;
+const ALLOWED_TOPICS = new Set(["delivery", "pricing", "other"]);
 
 class InvalidInputError extends Error {}
+
+class ModelError extends Error {}
 
 function json(response, status, body) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -45,10 +49,49 @@ function readText(payload) {
   return text;
 }
 
+function manualReview(response) {
+  return json(response, 200, { status: "manual_review", topic: null, draft: null });
+}
+
+async function requestClassification(text) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
+  try {
+    return await classify(text, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseModelOutput(raw) {
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    throw new ModelError("model output is not valid JSON");
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new ModelError("model output must be a JSON object");
+  }
+  const { topic, draft } = payload;
+  if (typeof topic !== "string" || !ALLOWED_TOPICS.has(topic)) {
+    throw new ModelError(`unexpected topic: ${String(topic)}`);
+  }
+  if (typeof draft !== "string" || draft.trim() === "") {
+    throw new ModelError("model draft must be a non-empty string");
+  }
+  return { topic, draft };
+}
+
 async function handleTriage(request, response) {
   const text = readText(parsePayload(await readBody(request)));
-  const result = JSON.parse(await classify(text));
-  return json(response, 200, { status: "ready", ...result });
+  let result;
+  try {
+    result = parseModelOutput(await requestClassification(text));
+  } catch {
+    return manualReview(response);
+  }
+  return json(response, 200, { status: "ready", topic: result.topic, draft: result.draft });
 }
 
 createServer(async (request, response) => {
