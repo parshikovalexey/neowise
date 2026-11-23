@@ -3,10 +3,33 @@ import { readFile } from "node:fs/promises";
 import { classify } from "./mock-ai.mjs";
 
 const html = await readFile(new URL("./index.html", import.meta.url));
+const AI_TIMEOUT_MS = 300;
+const ALLOWED_TOPICS = Object.freeze(["delivery", "pricing", "other"]);
 
 function json(response, status, body) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
+}
+
+function manualReview(response) {
+  return json(response, 200, { status: "manual_review", topic: null, draft: null });
+}
+
+async function classifyWithTimeout(text, timeoutMs = AI_TIMEOUT_MS) {
+  const controller = new AbortController();
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(new Error("AI request timed out"));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([classify(text, { signal: controller.signal }), timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function handleTriage(request, response) {
@@ -24,8 +47,30 @@ async function handleTriage(request, response) {
     return json(response, 400, { status: "invalid_input" });
   }
 
-  const result = JSON.parse(await classify(text));
-  return json(response, 200, { status: "ready", ...result });
+  return processText(text, response);
+}
+
+async function processText(text, response) {
+  try {
+    const result = JSON.parse(await classifyWithTimeout(text));
+    if (
+      result === null ||
+      typeof result !== "object" ||
+      !ALLOWED_TOPICS.includes(result.topic) ||
+      typeof result.draft !== "string" ||
+      result.draft.trim().length === 0
+    ) {
+      return manualReview(response);
+    }
+
+    return json(response, 200, {
+      status: "ready",
+      topic: result.topic,
+      draft: result.draft,
+    });
+  } catch {
+    return manualReview(response);
+  }
 }
 
 createServer(async (request, response) => {
